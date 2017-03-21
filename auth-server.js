@@ -20,6 +20,7 @@ var request = require('request');
 
 var config = require('./auth-config');
 
+mongoose.Promise = global.Promise;
 var userSchema = new mongoose.Schema({
   email: { type: String, lowercase: true },
   password: { type: String, select: false },
@@ -113,6 +114,31 @@ function createJWT(user) {
   return jwt.encode(payload, config.TOKEN_SECRET);
 }
 
+function decodeUserId(Authorization) {
+    const header = 'bearer ';
+    if (Authorization && Authorization.startsWith(header)) {
+        var token = Authorization.substr(header.length);
+        var payload = jwt.decode(token, config.TOKEN_SECRET);
+        if (payload) {
+            return mongoose.Types.ObjectId(payload.sub);
+        }
+    }
+}
+
+function saveOrUpdateUser(user) {
+  return User.findOne({ email: user.email })
+    .then((existingUser) => {
+      if (existingUser.provider == user.provider) {
+        return existingUser;
+      } else {
+        return User.findByIdAndUpdate(existingUser._id, user.toObject());
+      }
+    })
+    .catch((error) => {
+      return user.save();
+    });
+}
+
 /*
  |--------------------------------------------------------------------------
  | GET /api/me
@@ -177,12 +203,10 @@ app.post('/auth/signup', function(req, res) {
       email: req.body.email,
       password: req.body.password
     });
-    user.save(function(err, result) {
-      if (err) {
-        res.status(500).send({ message: err.message });
-      }
-      res.send({ token: createJWT(result) });
-    });
+    user._id = decodeUserId(req.header['Authorization']);
+    saveOrUpdateUser(user)
+      .then((user) => { res.send({ token: createJWT(user) }); })
+      .catch((err) => { res.status(500).send({ message: err.message }); });
   });
 });
 
@@ -214,41 +238,20 @@ app.post('/auth/google', function(req, res) {
 
     // Step 2. Retrieve profile information about the current user.
     request.get({ url: peopleApiUrl, headers: headers, json: true }, function(err, response, profile) {
-      if (profile.error) {
-        return res.status(500).send({message: profile.error.message});
-      }
+        if (profile.error) {
+            return res.status(500).send({message: profile.error.message});
+        }
 
-      User.findOne({ email: profile.email }, function(err, existingUser) {
-          if (existingUser && existingUser.provider == "google") {
-            var token = createJWT(existingUser);
+        var user = new User();
+        user._id = decodeUserId(req.header['Authorization']);
+        user.provider_id = profile.id;
+        user.provider = "google";
+        user.email = profile.email;
+        user.picture = profile.picture.replace('sz=50', 'sz=200');
+        user.displayName = profile.name;
+        saveOrUpdateUser(user).then(function(user) {
+            var token = createJWT(user);
             res.send({ token: token }); 
-          }
-          else if (existingUser && existingUser.provider != "google") {
-            var user = {};
-              user.provider_id = profile.id;
-              user.provider = "google";
-              user.email = profile.email;
-              user.picture = profile.picture.replace('sz=50', 'sz=200');
-              user.displayName = profile.name;
-              User.findOneAndUpdate({email:existingUser.email},user, function(err) {
-                var token = createJWT(existingUser);
-                res.send({ token: token });
-              });
-          }
-          else{
-              var user = new User();
-              user.provider_id = profile.id;
-              user.provider = "google";
-              user.email = profile.email;
-              user.picture = profile.picture.replace('sz=50', 'sz=200');
-              user.displayName = profile.name;
-              user.save(function(err) {
-                var token = createJWT(user);
-                res.send({ token: token });
-              });
-          }
-         // var token = req.header('Authorization').split(' ')[1];
-         // var payload = jwt.decode(token, config.TOKEN_SECRET);
         });
     });
   });
@@ -277,50 +280,18 @@ app.post('/auth/github', function(req, res) {
    // res.send({ token: accessToken });
     // Step 2. Retrieve profile information about the current user.
     request.get({ url: userApiUrl, qs: accessToken, headers: headers, json: true }, function(err, response, profile) {
+      var user = new User();
+      user._id = decodeUserId(req.header['Authorization']);
+      user.provider = 'github';
+      user.provider_id = profile.id;
+      user.picture = profile.avatar_url;
+      user.displayName = profile.name;
+      user.email = profile.email;
 
-      // Step 3a. Link user accounts.
-      if (req.header('Authorization')) {
-        User.findOne({ github: profile.id }, function(err, existingUser) {
-          if(err){
-            return res.status(500).send({message: "error occured"});
-          }
-          if (existingUser) {
-            return res.status(409).send({ message: 'There is already a GitHub account that belongs to you' });
-          }
-          var token = req.header('Authorization').split(' ')[1];
-          var payload = jwt.decode(token, config.TOKEN_SECRET);
-          User.findById(payload.sub, function(err, user) {
-            if (!user) {
-              return res.status(400).send({ message: 'User not found' });
-            }
-            user.github = profile.id;
-            user.picture = user.picture || profile.avatar_url;
-            user.displayName = user.displayName || profile.name;
-            user.save(function() {
-              var token = createJWT(user);
-              res.send({ token: token });
-            });
-          });
-        });
-      } else {
-        // Step 3b. Create a new user account or return an existing one.
-        User.findOne({ github: profile.id }, function(err, existingUser) {
-          if (existingUser) {
-            var token = createJWT(existingUser);
-            return res.send({ token: token });
-          }
-          var user = new User();
-          user.github = profile.id;
-          user.picture = profile.avatar_url;
-          user.displayName = profile.name;
-          user.email = profile.email;
-
-          user.save(function(err,user) {
-            var token = createJWT(user);
-            res.send({ token: token });
-          });
-        });
-      }
+      saveOrUpdateUser(user).then(function(user) {
+        var token = createJWT(user);
+        res.send({ token: token });
+      });
     }); 
   });
 });
@@ -355,37 +326,16 @@ app.post('/auth/linkedin', function(req, res) {
 
     // Step 2. Retrieve profile information about the current user.
     request.get({ url: peopleApiUrl, qs: params, json: true }, function(err, response, profile) {
-
-        // Step 3b. Create a new user account or return an existing one.
-        User.findOne({ email: profile.emailAddress }, function(err, existingUser) {
-        if (existingUser && existingUser.provider == "linkedin") {
-            var token = createJWT(existingUser);
+        var user = new User();
+        user._id = decodeUserId(req.header['Authorization']);
+        user.provider = "linkedin";
+        user.provider_id = profile.id;
+        user.email = profile.emailAddress;
+        user.picture = profile.pictureUrl;
+        user.displayName = profile.firstName + ' ' + profile.lastName;
+        saveOrUpdateUser(user).then(function(user) {
+            var token = createJWT(user);
             res.send({ token: token }); 
-          }
-          else if (existingUser && existingUser.provider != "linkedin") {
-            var user = {};
-              user.provider_id = profile.id;
-              user.provider = "linkedin";
-              user.email = profile.emailAddress;
-              user.picture = profile.pictureUrl;
-              user.displayName = profile.firstName+' '+profile.lastName;
-              User.findOneAndUpdate({email:existingUser.email},user, function(err) {
-                var token = createJWT(existingUser);
-                res.send({ token: token });
-              });
-          }
-          else{
-              var user = new User();
-              user.provider_id = profile.id;
-              user.provider = "linkedin";
-              user.email = profile.emailAddress;
-              user.picture = profile.pictureUrl;
-              user.displayName = profile.firstName+' '+profile.lastName;
-              user.save(function() {
-                var token = createJWT(user);
-                res.send({ token: token });
-              });
-        }
         });
     });
   });
@@ -418,38 +368,17 @@ app.post('/auth/facebook', function(req, res) {
       if (response.statusCode !== 200) {
         return res.status(500).send({ message: profile.error.message });
       }
-      User.findOne({ email: profile.email }, function(err, existingUser) {
-          if (existingUser && existingUser.provider == "facebook") {
-            var token = createJWT(existingUser);
-            res.send({ token: token }); 
-          }
-          else if (existingUser && existingUser.provider != "facebook") {
-            var user = {};
-              user.provider_id = profile.id;
-              user.provider = "facebook";
-              user.email = profile.email;
-              user.picture = profile.picture.data.url;
-              user.displayName = profile.name;
-              User.findOneAndUpdate({email:existingUser.email},user, function(err) {
-                var token = createJWT(existingUser);
-                res.send({ token: token });
-              });
-          }
-          else{
-              var user = new User();
-              user.provider_id = profile.id;
-              user.provider = "facebook";
-              user.email = profile.email;
-              user.picture = profile.picture.data.url;
-              user.displayName = profile.name;
-              user.save(function(err) {
-                var token = createJWT(user);
-                res.send({ token: token });
-              });
-          }
-         // var token = req.header('Authorization').split(' ')[1];
-         // var payload = jwt.decode(token, config.TOKEN_SECRET);
-        });
+      var user = new User();
+      user._id = decodeUserId(req.header['Authorization']);
+      user.provider_id = profile.id;
+      user.provider = "facebook";
+      user.email = profile.email;
+      user.picture = profile.picture.data.url;
+      user.displayName = profile.name;
+      saveOrUpdateUser(user).then(function(user) {
+        var token = createJWT(user);
+        res.send({ token: token }); 
+      });
     });
   });
 });
@@ -477,42 +406,15 @@ app.post('/auth/yahoo', function(req, res) {
 
     // Step 2. Retrieve profile information about the current user.
     request.get({ url: socialApiUrl, headers: headers, json: true }, function(err, response, body) {
-
-      // Step 3a. Link user accounts.
-      if (req.header('Authorization')) {
-        User.findOne({ yahoo: body.profile.guid }, function(err, existingUser) {
-          if (existingUser) {
-            return res.status(409).send({ message: 'There is already a Yahoo account that belongs to you' });
-          }
-          var token = req.header('Authorization').split(' ')[1];
-          var payload = jwt.decode(token, config.TOKEN_SECRET);
-          User.findById(payload.sub, function(err, user) {
-            if (!user) {
-              return res.status(400).send({ message: 'User not found' });
-            }
-            user.yahoo = body.profile.guid;
-            user.displayName = user.displayName || body.profile.nickname;
-            user.save(function() {
-              var token = createJWT(user);
-              res.send({ token: token });
-            });
-          });
-        });
-      } else {
-        // Step 3b. Create a new user account or return an existing one.
-        User.findOne({ yahoo: body.profile.guid }, function(err, existingUser) {
-          if (existingUser) {
-            return res.send({ token: createJWT(existingUser) });
-          }
-          var user = new User();
-          user.yahoo = body.profile.guid;
-          user.displayName = body.profile.nickname;
-          user.save(function() {
-            var token = createJWT(user);
-            res.send({ token: token });
-          });
-        });
-      }
+      var user = new User();
+      user._id = decodeUserId(req.header['Authorization']);
+      user.provider = 'yahoo';
+      user.provider_id = body.profile.guid;
+      user.displayName = body.profile.nickname;
+      user.saveOrUpdateUser(user).then(function(user) {
+        var token = createJWT(user);
+        res.send({ token: token });
+      });
     });
   });
 });
@@ -572,48 +474,17 @@ app.post('/auth/twitter', function(req, res) {
         oauth: profileOauth,
         json: true
       }, function(err, response, profile) {
+        var user = new User();
+        user._id = decodeUserId(req.header['Authorization']);
+        user.provider = 'twitter';
+        user.provider_id = profile.id;
+        user.email = profile.email;
+        user.displayName = profile.name;
+        user.picture = profile.profile_image_url_https.replace('_normal', '');
 
-        // Step 5a. Link user accounts.
-        if (req.header('Authorization')) {
-          User.findOne({ twitter: profile.id }, function(err, existingUser) {
-            if (existingUser) {
-              return res.status(409).send({ message: 'There is already a Twitter account that belongs to you' });
-            }
-
-            var token = req.header('Authorization').split(' ')[1];
-            var payload = jwt.decode(token, config.TOKEN_SECRET);
-
-            User.findById(payload.sub, function(err, user) {
-              if (!user) {
-                return res.status(400).send({ message: 'User not found' });
-              }
-
-              user.twitter = profile.id;
-              user.email = profile.email;
-              user.displayName = user.displayName || profile.name;
-              user.picture = user.picture || profile.profile_image_url_https.replace('_normal', '');
-              user.save(function(err) {
-                res.send({ token: createJWT(user) });
-              });
-            });
-          });
-        } else {
-          // Step 5b. Create a new user account or return an existing one.
-          User.findOne({ twitter: profile.id }, function(err, existingUser) {
-            if (existingUser) {
-              return res.send({ token: createJWT(existingUser) });
-            }
-
-            var user = new User();
-            user.twitter = profile.id;
-            user.email = profile.email;
-            user.displayName = profile.name;
-            user.picture = profile.profile_image_url_https.replace('_normal', '');
-            user.save(function() {
-              res.send({ token: createJWT(user) });
-            });
-          });
-        }
+        saveOrUpdateUser(user).then(function(user) {
+          res.send({ token: createJWT(user) });
+        });
       });
     });
   }
@@ -646,44 +517,17 @@ app.post('/auth/foursquare', function(req, res) {
     request.get({ url: profileUrl, qs: params, json: true }, function(err, response, profile) {
       profile = profile.response.user;
 
-      // Step 3a. Link user accounts.
-      if (req.header('Authorization')) {
-        User.findOne({ foursquare: profile.id }, function(err, existingUser) {
-          if (existingUser) {
-            return res.status(409).send({ message: 'There is already a Foursquare account that belongs to you' });
-          }
-          var token = req.header('Authorization').split(' ')[1];
-          var payload = jwt.decode(token, config.TOKEN_SECRET);
-          User.findById(payload.sub, function(err, user) {
-            if (!user) {
-              return res.status(400).send({ message: 'User not found' });
-            }
-            user.foursquare = profile.id;
-            user.picture = user.picture || profile.photo.prefix + '300x300' + profile.photo.suffix;
-            user.displayName = user.displayName || profile.firstName + ' ' + profile.lastName;
-            user.save(function() {
-              var token = createJWT(user);
-              res.send({ token: token });
-            });
-          });
-        });
-      } else {
-        // Step 3b. Create a new user account or return an existing one.
-        User.findOne({ foursquare: profile.id }, function(err, existingUser) {
-          if (existingUser) {
-            var token = createJWT(existingUser);
-            return res.send({ token: token });
-          }
-          var user = new User();
-          user.foursquare = profile.id;
-          user.picture = profile.photo.prefix + '300x300' + profile.photo.suffix;
-          user.displayName = profile.firstName + ' ' + profile.lastName;
-          user.save(function() {
-            var token = createJWT(user);
-            res.send({ token: token });
-          });
-        });
-      }
+      var user = new User();
+      user._id = decodeUserId(req.header['Authorization']);
+      user.provider = 'foursquare';
+      user.provider_id = profile.id;
+      user.picture = profile.photo.prefix + '300x300' + profile.photo.suffix;
+      user.displayName = profile.firstName + ' ' + profile.lastName;
+
+      saveOrUpdateUser(user).then(function(user) {
+        var token = createJWT(user);
+        res.send({ token: token });
+      });
     });
   });
 });
@@ -712,46 +556,17 @@ app.post('/auth/twitch', function(req, res) {
 
     // Step 2. Retrieve information about the current user.
     request.get({ url: profileUrl, qs: params, json: true }, function(err, response, profile) {
-      // Step 3a. Link user accounts.
-      if (req.header('Authorization')) {
-        User.findOne({ twitch: profile._id }, function(err, existingUser) {
-          if (existingUser) {
-            return res.status(409).send({ message: 'There is already a Twitch account that belongs to you' });
-          }
-          var token = req.header('Authorization').split(' ')[1];
-          var payload = jwt.decode(token, config.TOKEN_SECRET);
-          User.findById(payload.sub, function(err, user) {
-            if (!user) {
-              return res.status(400).send({ message: 'User not found' });
-            }
-            user.twitch = profile._id;
-            user.picture = user.picture || profile.logo;
-            user.displayName = user.name || profile.name;
-            user.email = user.email || profile.email;
-            user.save(function() {
-              var token = createJWT(user);
-              res.send({ token: token });
-            });
-          });
-        });
-      } else {
-        // Step 3b. Create a new user account or return an existing one.
-        User.findOne({ twitch: profile._id }, function(err, existingUser) {
-          if (existingUser) {
-            var token = createJWT(existingUser);
-            return res.send({ token: token });
-          }
-          var user = new User();
-          user.twitch = profile._id;
-          user.picture = profile.logo;
-          user.displayName = profile.name;
-          user.email = profile.email;
-          user.save(function() {
-            var token = createJWT(user);
-            res.send({ token: token });
-          });
-        });
-      }
+      var user = new User();
+      user._id = decodeUserId(req.header['Authorization']);
+      user.provider = 'twitch';
+      user.provider_id = profile._id;
+      user.picture = profile.logo;
+      user.displayName = profile.name;
+      user.email = profile.email;
+      saveOrUpdateUser(user).then(function(user) {
+        var token = createJWT(user);
+        res.send({ token: token });
+      });
     });
   });
 });
@@ -791,48 +606,16 @@ app.post('/auth/bitbucket', function(req, res) {
 
       // Step 2.5. Retrieve current user's email.
       request.get({ url: emailApiUrl, qs: params, json: true }, function(err, response, emails) {
-        var email = emails.values[0].email;
-
-        // Step 3a. Link user accounts.
-        if (req.header('Authorization')) {
-          User.findOne({ bitbucket: profile.uuid }, function(err, existingUser) {
-            if (existingUser) {
-              return res.status(409).send({ message: 'There is already a Bitbucket account that belongs to you' });
-            }
-            var token = req.header('Authorization').split(' ')[1];
-            var payload = jwt.decode(token, config.TOKEN_SECRET);
-            User.findById(payload.sub, function(err, user) {
-              if (!user) {
-                return res.status(400).send({ message: 'User not found' });
-              }
-              user.bitbucket = profile.uuid;
-              user.email = user.email || email;
-              user.picture = user.picture || profile.links.avatar.href;
-              user.displayName = user.displayName || profile.display_name;
-              user.save(function() {
-                var token = createJWT(user);
-                res.send({ token: token });
-              });
-            });
-          });
-        } else {
-          // Step 3b. Create a new user account or return an existing one.
-          User.findOne({ bitbucket: profile.id }, function(err, existingUser) {
-            if (existingUser) {
-              var token = createJWT(existingUser);
-              return res.send({ token: token });
-            }
-            var user = new User();
-            user.bitbucket = profile.uuid;
-            user.email = email;
-            user.picture = profile.links.avatar.href;
-            user.displayName = profile.display_name;
-            user.save(function() {
-              var token = createJWT(user);
-              res.send({ token: token });
-            });
-          });
-        }
+        var user = new User();
+        user._id = decodeUserId(req.header['Authorization']);
+        user.bitbucket = profile.uuid;
+        user.email = emails.values[0].email;
+        user.picture = profile.links.avatar.href;
+        user.displayName = profile.display_name;
+        saveOrUpdateUser(user).then(function(user) {
+          var token = createJWT(user);
+          res.send({ token: token });
+        });
       });
     });
   });
@@ -864,47 +647,17 @@ app.post('/auth/bitbucket', function(req, res) {
      }
 
      request.get(userUrl, {json: true, headers: {Authorization: 'Bearer ' + body.access_token} }, function(err, response, profile){
-       // Step 3a. Link user accounts.
-       if (req.header('Authorization')) {
-         User.findOne({ spotify: profile.id }, function(err, existingUser) {
-           if (existingUser) {
-             return res.status(409).send({ message: 'There is already a Spotify account that belongs to you' });
-           }
-           var token = req.header('Authorization').split(' ')[1];
-           var payload = jwt.decode(token, config.TOKEN_SECRET);
-           User.findById(payload.sub, function(err, user) {
-             if (!user) {
-               return res.status(400).send({ message: 'User not found' });
-             }
-             user.spotify = profile.id;
-             user.email = user.email || profile.email;
-             user.picture = profile.images.length > 0 ? profile.images[0].url : '';
-             user.displayName = user.displayName || profile.displayName || profile.id;
+       var user = new User();
+       user._id = decodeUserId(req.header['Authorization']);
+       user.spotify = profile.id;
+       user.email = profile.email;
+       user.picture = profile.images.length > 0 ? profile.images[0].url : '';
+       user.displayName = profile.displayName || profile.id;
 
-             user.save(function() {
-               var token = createJWT(user);
-               res.send({ token: token });
-             });
-           });
-         });
-       } else {
-         // Step 3b. Create a new user account or return an existing one.
-         User.findOne({ spotify: profile.id }, function(err, existingUser) {
-           if (existingUser) {
-             return res.send({ token: createJWT(existingUser) });
-           }
-           var user = new User();
-           user.spotify = profile.id;
-           user.email = profile.email;
-           user.picture = profile.images.length > 0 ? profile.images[0].url : '';
-           user.displayName = profile.displayName || profile.id;
-
-           user.save(function(err) {
-             var token = createJWT(user);
-             res.send({ token: token });
-           });
-         });
-       }
+       saveOrUpdateUser(user).then(function(user) {
+         var token = createJWT(user);
+         res.send({ token: token });
+       });
      });
    });
  });
